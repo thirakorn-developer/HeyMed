@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "heymed_pharmacy": {
+      "command": "/Users/thirakornmokkawes/MyDesk/HeyMed/mcp-server/.venv/bin/python",
+      "args": ["-m", "heymed_mcp.server"],
+      "cwd": "/Users/thirakornmokkawes/MyDesk/HeyMed/mcp-server",
+      "env": {
+        "POSTGRES_HOST": "localhost",
+        "POSTGRES_PORT": "5432",
+        "POSTGRES_DB": "heymed",
+        "POSTGRES_USER": "heymed",
+        "POSTGRES_PASSWORD": "heymed_secret"
+      }
+    }
+  }
+}

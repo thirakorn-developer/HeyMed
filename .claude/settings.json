@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__heymed_pharmacy__search_drugs_ndc",
+      "mcp__heymed_pharmacy__search_drugs_rxnorm",
+      "mcp__heymed_pharmacy__get_drug_detail",
+      "mcp__heymed_pharmacy__lookup_ndc",
+      "mcp__heymed_pharmacy__suggest_spelling",
+      "mcp__heymed_pharmacy__check_drug_interactions",
+      "mcp__heymed_pharmacy__get_adverse_events",
+      "mcp__heymed_pharmacy__get_drug_recalls",
+      "mcp__heymed_pharmacy__search_drug_labels",
+      "mcp__heymed_pharmacy__get_drug_label_full",
+      "mcp__heymed_pharmacy__get_dosing_info",
+      "mcp__heymed_pharmacy__get_pregnancy_lactation_info",
+      "mcp__heymed_pharmacy__get_warnings_contraindications",
+      "mcp__heymed_pharmacy__find_alternatives",
+      "mcp__heymed_pharmacy__browse_drug_class",
+      "mcp__heymed_pharmacy__list_drug_classes",
+      "mcp__heymed_pharmacy__search_controlled_substances",
+      "mcp__heymed_pharmacy__check_therapeutic_duplicates",
+      "mcp__heymed_pharmacy__get_special_population_dosing",
+      "mcp__heymed_pharmacy__get_ndc_stats",
+      "Bash(docker compose *)",
+      "Bash(curl -s *)"
+    ]
+  }
+}

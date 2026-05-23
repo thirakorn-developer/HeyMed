@@ -1,0 +1,13 @@
+[project]
+name = "heymed-mcp"
+version = "0.1.0"
+description = "HeyMed Pharmacy AI - MCP Server"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.9.0",
+    "httpx>=0.28.0",
+    "asyncpg>=0.30.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["heymed_mcp*"]
