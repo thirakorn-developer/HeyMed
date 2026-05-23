@@ -1,4 +1,5 @@
 import json
+from datetime import date as date_type
 from itertools import combinations
 
 from mcp.server.fastmcp import FastMCP
@@ -10,7 +11,8 @@ mcp = FastMCP(
     instructions="""You are a pharmacy AI assistant with access to drug databases.
 Use these tools to look up real drug data — never guess drug facts from memory.
 Always check interactions when a patient takes multiple medications.
-Data sources: FDA NDC Directory (113K products), RxNorm, OpenFDA, DailyMed.""",
+Data sources: FDA NDC Directory (113K products), RxNorm, OpenFDA, DailyMed.
+Patient safety: medication records, allergy cross-reactivity, therapeutic duplicate detection.""",
 )
 
 
@@ -493,6 +495,303 @@ async def get_special_population_dosing(drug_name: str) -> str:
         "geriatric_use": label.get("geriatric_use", []),
         "source": "openfda_labels",
     })
+
+
+# ── Patient Safety Tools ──
+
+
+@mcp.tool()
+async def create_patient(full_name: str, date_of_birth: str = "", gender: str = "", phone: str = "") -> str:
+    """Create a new patient record. Returns the patient ID for use with other patient tools.
+    date_of_birth format: YYYY-MM-DD"""
+    dob = None
+    if date_of_birth:
+        dob = date_type.fromisoformat(date_of_birth)
+    row = await db.query_one(
+        """
+        INSERT INTO patients (id, full_name, date_of_birth, gender, phone, is_active)
+        VALUES (gen_random_uuid(), $1, $2, NULLIF($3,''), NULLIF($4,''), true)
+        RETURNING id, full_name, date_of_birth, gender, phone, created_at
+        """,
+        full_name,
+        dob,
+        gender,
+        phone,
+    )
+    return json.dumps({"patient": row}, default=str)
+
+
+@mcp.tool()
+async def search_patients(query: str) -> str:
+    """Search patients by name or phone number."""
+    rows = await db.query(
+        """
+        SELECT id, full_name, date_of_birth, gender, phone, is_active, created_at
+        FROM patients
+        WHERE full_name ILIKE $1 OR phone ILIKE $1
+        ORDER BY full_name
+        LIMIT 20
+        """,
+        f"%{query}%",
+    )
+    return json.dumps({"patients": rows, "total": len(rows)}, default=str)
+
+
+@mcp.tool()
+async def add_patient_medication(
+    patient_id: str,
+    drug_name: str,
+    dosage: str = "",
+    frequency: str = "",
+    route: str = "",
+    prescriber: str = "",
+) -> str:
+    """Add a medication to a patient's active medication list. This is used to track
+    what the patient is currently taking for interaction and safety checks."""
+    # Look up pharm class for the drug
+    ndc_info = await db.query_one(
+        """
+        SELECT generic_name, product_ndc FROM ndc_products
+        WHERE search_vector @@ plainto_tsquery('english', $1)
+        ORDER BY ts_rank(search_vector, plainto_tsquery('english', $1)) DESC
+        LIMIT 1
+        """,
+        drug_name,
+    )
+    row = await db.query_one(
+        """
+        INSERT INTO patient_medications
+            (id, patient_id, drug_name, generic_name, product_ndc, dosage, frequency, route, prescriber, status)
+        VALUES
+            (gen_random_uuid(), $1::uuid, $2, $3, $4, NULLIF($5,''), NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), 'active')
+        RETURNING id, drug_name, generic_name, dosage, frequency, status, created_at
+        """,
+        patient_id,
+        drug_name,
+        ndc_info["generic_name"] if ndc_info else drug_name,
+        ndc_info["product_ndc"] if ndc_info else None,
+        dosage,
+        frequency,
+        route,
+        prescriber,
+    )
+    return json.dumps({"medication_added": row}, default=str)
+
+
+@mcp.tool()
+async def get_patient_medications(patient_id: str) -> str:
+    """Get all active medications for a patient. Essential for interaction checking
+    and prescription review."""
+    patient = await db.query_one("SELECT full_name FROM patients WHERE id = $1::uuid", patient_id)
+    if not patient:
+        return json.dumps({"error": "Patient not found"})
+
+    meds = await db.query(
+        """
+        SELECT id, drug_name, generic_name, dosage, frequency, route, prescriber,
+               start_date, status, created_at
+        FROM patient_medications
+        WHERE patient_id = $1::uuid AND status = 'active'
+        ORDER BY created_at DESC
+        """,
+        patient_id,
+    )
+    return json.dumps({
+        "patient_id": patient_id,
+        "patient_name": patient["full_name"],
+        "active_medications": meds,
+        "total": len(meds),
+    }, default=str)
+
+
+@mcp.tool()
+async def add_patient_allergy(
+    patient_id: str,
+    allergen: str,
+    reaction: str = "",
+    severity: str = "moderate",
+) -> str:
+    """Record a drug allergy for a patient. Severity: mild, moderate, severe, life_threatening.
+    The system will auto-detect the drug's pharmacologic class for cross-reactivity checking."""
+    # Look up pharm class for cross-reactivity
+    ndc_info = await db.query_one(
+        """
+        SELECT pharm_classes FROM ndc_products
+        WHERE generic_name ILIKE $1
+          AND pharm_classes IS NOT NULL AND pharm_classes != ''
+          AND substance_name NOT LIKE '%;%'
+        LIMIT 1
+        """,
+        f"%{allergen}%",
+    )
+    pharm_class = None
+    if ndc_info and ndc_info["pharm_classes"]:
+        for cls in ndc_info["pharm_classes"].split(","):
+            if "[EPC]" in cls:
+                pharm_class = cls.replace("[EPC]", "").strip()
+                break
+
+    row = await db.query_one(
+        """
+        INSERT INTO patient_allergies
+            (id, patient_id, allergen, allergen_type, reaction, severity, pharm_class)
+        VALUES
+            (gen_random_uuid(), $1::uuid, $2, 'drug', NULLIF($3,''), $4::allergyseverity, $5)
+        RETURNING id, allergen, reaction, severity, pharm_class, created_at
+        """,
+        patient_id, allergen, reaction, severity, pharm_class,
+    )
+    return json.dumps({"allergy_recorded": row}, default=str)
+
+
+@mcp.tool()
+async def get_patient_allergies(patient_id: str) -> str:
+    """Get all recorded allergies for a patient."""
+    patient = await db.query_one("SELECT full_name FROM patients WHERE id = $1::uuid", patient_id)
+    if not patient:
+        return json.dumps({"error": "Patient not found"})
+
+    allergies = await db.query(
+        """
+        SELECT id, allergen, reaction, severity, pharm_class, created_at
+        FROM patient_allergies
+        WHERE patient_id = $1::uuid
+        ORDER BY severity DESC, created_at DESC
+        """,
+        patient_id,
+    )
+    return json.dumps({
+        "patient_id": patient_id,
+        "patient_name": patient["full_name"],
+        "allergies": allergies,
+        "total": len(allergies),
+    }, default=str)
+
+
+@mcp.tool()
+async def check_allergy_cross_reactivity(patient_id: str, drug_name: str) -> str:
+    """Check if a drug could cause an allergic reaction based on the patient's recorded allergies.
+    Uses pharmacologic class matching — if a patient is allergic to penicillin, flags all
+    penicillin-class drugs. Critical safety check before dispensing."""
+    allergies = await db.query(
+        "SELECT allergen, reaction, severity, pharm_class FROM patient_allergies WHERE patient_id = $1::uuid",
+        patient_id,
+    )
+    if not allergies:
+        return json.dumps({"safe": True, "message": "No allergies recorded for this patient"})
+
+    # Get the drug's pharm class
+    drug_info = await db.query_one(
+        """
+        SELECT generic_name, pharm_classes FROM ndc_products
+        WHERE search_vector @@ plainto_tsquery('english', $1)
+          AND pharm_classes IS NOT NULL
+          AND substance_name NOT LIKE '%;%'
+        ORDER BY ts_rank(search_vector, plainto_tsquery('english', $1)) DESC
+        LIMIT 1
+        """,
+        drug_name,
+    )
+
+    alerts = []
+    drug_name_lower = drug_name.lower()
+
+    for allergy in allergies:
+        # Direct name match
+        if allergy["allergen"].lower() in drug_name_lower or drug_name_lower in allergy["allergen"].lower():
+            alerts.append({
+                "type": "DIRECT_MATCH",
+                "severity": "critical",
+                "allergen": allergy["allergen"],
+                "reaction": allergy["reaction"],
+                "recorded_severity": allergy["severity"],
+                "message": f"DIRECT ALLERGY: Patient is allergic to {allergy['allergen']}!",
+            })
+            continue
+
+        # Cross-reactivity via pharmacologic class
+        if allergy["pharm_class"] and drug_info and drug_info["pharm_classes"]:
+            if allergy["pharm_class"].lower() in drug_info["pharm_classes"].lower():
+                alerts.append({
+                    "type": "CROSS_REACTIVITY",
+                    "severity": "high",
+                    "allergen": allergy["allergen"],
+                    "drug_class": allergy["pharm_class"],
+                    "reaction": allergy["reaction"],
+                    "message": f"CROSS-REACTIVITY: {drug_name} is in the same class ({allergy['pharm_class']}) as allergen {allergy['allergen']}",
+                })
+
+    return json.dumps({
+        "patient_id": patient_id,
+        "drug_checked": drug_name,
+        "safe": len(alerts) == 0,
+        "alerts": alerts,
+        "total_alerts": len(alerts),
+    }, default=str)
+
+
+@mcp.tool()
+async def patient_safety_check(patient_id: str, new_drug: str) -> str:
+    """Comprehensive safety check before dispensing a new drug to a patient.
+    Checks: 1) allergy cross-reactivity, 2) interactions with current meds,
+    3) therapeutic duplicates. This is the ONE tool to call before dispensing."""
+    patient = await db.query_one(
+        "SELECT full_name FROM patients WHERE id = $1::uuid", patient_id
+    )
+    if not patient:
+        return json.dumps({"error": "Patient not found"})
+
+    # 1. Allergy check
+    allergy_result = json.loads(await check_allergy_cross_reactivity(patient_id, new_drug))
+
+    # 2. Get current meds
+    meds = await db.query(
+        "SELECT drug_name, generic_name FROM patient_medications WHERE patient_id = $1::uuid AND status = 'active'",
+        patient_id,
+    )
+    med_names = [m["generic_name"] or m["drug_name"] for m in meds]
+
+    # 3. Interaction check with current meds
+    interaction_alerts = []
+    if med_names:
+        for med_name in med_names:
+            result = await external_apis.openfda_interaction_check(new_drug, med_name)
+            if result:
+                interaction_alerts.append({
+                    "current_med": med_name,
+                    "new_drug": new_drug,
+                    "total_labels": result["total_labels"],
+                    "excerpt": result["mentions"][0]["interaction_text"][:500] if result["mentions"] else "",
+                })
+
+    # 4. Therapeutic duplicate check
+    all_drugs = med_names + [new_drug]
+    dup_result = json.loads(await check_therapeutic_duplicates(all_drugs)) if len(all_drugs) >= 2 else {"duplicates": []}
+
+    is_safe = (
+        allergy_result.get("safe", True)
+        and len(interaction_alerts) == 0
+        and len(dup_result.get("duplicates", [])) == 0
+    )
+
+    return json.dumps({
+        "patient_name": patient["full_name"],
+        "new_drug": new_drug,
+        "overall_safe": is_safe,
+        "allergy_check": {
+            "safe": allergy_result.get("safe", True),
+            "alerts": allergy_result.get("alerts", []),
+        },
+        "interaction_check": {
+            "current_medications": med_names,
+            "interactions_found": len(interaction_alerts),
+            "interactions": interaction_alerts,
+        },
+        "duplicate_check": {
+            "duplicates_found": len(dup_result.get("duplicates", [])),
+            "duplicates": dup_result.get("duplicates", []),
+        },
+    }, default=str)
 
 
 @mcp.tool()

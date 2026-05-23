@@ -102,23 +102,56 @@ async def openfda_interaction_check(drug1: str, drug2: str) -> dict | None:
                 excerpt = interaction_text[start:end]
             else:
                 excerpt = interaction_text[:700]
+            severity = _classify_interaction_severity(excerpt)
             mentions.append({
                 "source_drug": openfda.get("generic_name", [source_drug])[0],
                 "brand": openfda.get("brand_name", [""])[0],
                 "target_drug": target_drug,
+                "severity": severity,
                 "interaction_text": excerpt,
                 "total_labels": total,
             })
 
     if not mentions:
         return None
+
+    severities = [m["severity"] for m in mentions]
+    severity_rank = {"major": 3, "moderate": 2, "minor": 1}
+    overall = max(severities, key=lambda s: severity_rank.get(s, 0))
+
     return {
         "drug1": drug1,
         "drug2": drug2,
         "found": True,
+        "severity": overall,
         "total_labels": sum(m["total_labels"] for m in mentions),
         "mentions": mentions,
     }
+
+
+_MAJOR_KEYWORDS = [
+    "contraindicated", "do not use", "avoid", "not recommended",
+    "fatal", "death", "life-threatening", "serious bleeding",
+    "severe", "black box", "boxed warning", "discontinue",
+    "prohibited", "never", "dangerous",
+]
+_MODERATE_KEYWORDS = [
+    "monitor", "caution", "adjust dose", "dose adjustment",
+    "reduce dose", "increased risk", "may increase", "may decrease",
+    "closely monitor", "clinical significance", "use with caution",
+    "potential", "significant",
+]
+
+
+def _classify_interaction_severity(text: str) -> str:
+    text_lower = text.lower()
+    for kw in _MAJOR_KEYWORDS:
+        if kw in text_lower:
+            return "major"
+    for kw in _MODERATE_KEYWORDS:
+        if kw in text_lower:
+            return "moderate"
+    return "minor"
 
 
 async def openfda_adverse_events(drug_name: str, limit: int = 10) -> list[dict]:
