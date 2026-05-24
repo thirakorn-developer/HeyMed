@@ -20,11 +20,15 @@ SYSTEM_PROMPT = """You are HeyMed AI, a pharmacy assistant for Thai pharmacists.
 You help with drug information, interactions, dosing, and patient safety.
 
 RULES:
-- ALWAYS use tools to look up drug data. Never guess from memory.
+- ALWAYS use tools to look up drug data. Never guess or say "no data available" without trying a tool first.
 - Respond in the same language the user uses (Thai or English).
 - Keep responses concise and practical for pharmacy use.
 - Always mention important warnings and contraindications.
-- For dosing: show the calculation AND remind to verify with FDA label."""
+- For dosing: show the calculation AND remind to verify with FDA label.
+- When patient has an allergy: use find_alternatives to suggest drugs in different classes.
+- When asking about drugs in Thailand: use thai_fda_search.
+- For drug class questions: use browse_drug_class (supports abbreviations like "statin", "ACE inhibitor", "NSAID").
+- Use multiple tools in sequence if needed to give a complete answer."""
 
 TOOLS = [
     {"type": "function", "function": {
@@ -103,6 +107,41 @@ TOOLS = [
             "drug_name": {"type": "string"},
         }, "required": ["drug_name"]},
     }},
+    {"type": "function", "function": {
+        "name": "find_alternatives",
+        "description": "Find alternative drugs in the same pharmacological class. Use when patient needs a substitute (e.g., allergic to one drug, need another in same class, or looking for generic options).",
+        "parameters": {"type": "object", "properties": {
+            "drug_name": {"type": "string", "description": "Drug to find alternatives for"},
+        }, "required": ["drug_name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "storage_conditions",
+        "description": "Get drug storage requirements (refrigeration, room temperature, light sensitivity).",
+        "parameters": {"type": "object", "properties": {
+            "drug_name": {"type": "string"},
+        }, "required": ["drug_name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "thai_fda_search",
+        "description": "Search Thai FDA (อย.) drug registration database. Check if drug is registered in Thailand.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"},
+        }, "required": ["query"]},
+    }},
+    {"type": "function", "function": {
+        "name": "dosing_info",
+        "description": "Get FDA-approved dosage and administration guidelines from official drug label.",
+        "parameters": {"type": "object", "properties": {
+            "drug_name": {"type": "string"},
+        }, "required": ["drug_name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "browse_drug_class",
+        "description": "Browse all drugs in a pharmacological class. Accepts abbreviations: statin, ACE inhibitor, PPI, NSAID, ARB, SSRI, beta blocker, CCB.",
+        "parameters": {"type": "object", "properties": {
+            "pharmacologic_class": {"type": "string", "description": "Class name or abbreviation"},
+        }, "required": ["pharmacologic_class"]},
+    }},
 ]
 
 TOOL_ENDPOINT_MAP = {
@@ -110,8 +149,12 @@ TOOL_ENDPOINT_MAP = {
     "check_interactions": ("POST", "/api/v1/interactions/check", lambda a: a),
     "adverse_events": ("GET", "/api/v1/interactions/adverse-events", lambda a: {"drug_name": a["drug_name"]}),
     "food_interactions": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 3}),
-    "find_alternatives": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 5}),
+    "find_alternatives": ("GET", "/api/v1/ndc/search", lambda a: {"q": a["drug_name"], "limit": 10}),
     "pregnancy_info": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 1}),
+    "storage_conditions": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 1}),
+    "thai_fda_search": ("GET", "/api/v1/ndc/search", lambda a: {"q": a["query"], "limit": 5}),
+    "dosing_info": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 1}),
+    "browse_drug_class": ("GET", "/api/v1/ndc/search", lambda a: {"q": a["pharmacologic_class"], "limit": 10}),
     "warnings": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 1}),
     "drug_recalls": ("GET", "/api/v1/interactions/recalls", lambda a: {"drug_name": a["drug_name"]}),
     "calculate_dose": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 1}),
