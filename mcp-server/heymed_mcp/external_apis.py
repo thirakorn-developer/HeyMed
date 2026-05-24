@@ -169,6 +169,58 @@ async def openfda_adverse_events(drug_name: str, limit: int = 10) -> list[dict]:
     return [{"reaction": r["term"], "count": r["count"]} for r in resp.json().get("results", [])]
 
 
+async def openfda_food_interactions(drug_name: str) -> dict | None:
+    label = await openfda_drug_label_sections(drug_name)
+    if not label:
+        return None
+
+    food_info: dict = {
+        "drug_name": drug_name,
+        "brand_name": label.get("brand_name", []),
+    }
+
+    food_keywords = ["food", "meal", "grapefruit", "juice", "alcohol", "milk",
+                     "dairy", "calcium", "antacid", "empty stomach", "with food",
+                     "without food", "high-fat", "dietary", "caffeine", "fiber"]
+
+    # Search in dosing and interactions sections
+    for section_name in ["dosage_and_administration", "drug_interactions", "warnings"]:
+        section_text = label.get(section_name, [""])[0] if label.get(section_name) else ""
+        if not section_text:
+            continue
+        text_lower = section_text.lower()
+        for keyword in food_keywords:
+            idx = text_lower.find(keyword)
+            if idx >= 0:
+                start = max(0, idx - 150)
+                end = min(len(section_text), idx + 350)
+                excerpt = section_text[start:end].strip()
+                food_info.setdefault("food_interactions", []).append({
+                    "keyword": keyword,
+                    "section": section_name,
+                    "text": excerpt,
+                })
+
+    if "food_interactions" not in food_info:
+        food_info["food_interactions"] = []
+        food_info["message"] = "No specific food interaction information found in FDA label"
+
+    return food_info
+
+
+async def openfda_storage_conditions(drug_name: str) -> dict | None:
+    label = await openfda_drug_label_sections(drug_name)
+    if not label:
+        return None
+
+    return {
+        "drug_name": drug_name,
+        "brand_name": label.get("brand_name", []),
+        "how_supplied": label.get("how_supplied", []),
+        "storage_and_handling": label.get("storage_and_handling", []),
+    }
+
+
 async def openfda_recalls(drug_name: str, limit: int = 5) -> list[dict]:
     client = _get_client()
     resp = await client.get(

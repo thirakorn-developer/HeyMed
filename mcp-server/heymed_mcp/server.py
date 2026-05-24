@@ -498,6 +498,162 @@ async def get_special_population_dosing(drug_name: str) -> str:
     })
 
 
+# ── Food Interactions, Storage & OTC Tools ──
+
+
+@mcp.tool()
+async def get_food_interactions(drug_name: str) -> str:
+    """Get drug-food interaction information from FDA labels.
+    Checks for interactions with food, alcohol, grapefruit, dairy, caffeine, etc.
+    Essential for patient counseling (e.g., "take with food", "avoid grapefruit")."""
+    result = await external_apis.openfda_food_interactions(drug_name)
+    if not result:
+        return json.dumps({"error": f"No food interaction data found for {drug_name}"})
+    return json.dumps({**result, "source": "openfda_labels"})
+
+
+@mcp.tool()
+async def get_storage_conditions(drug_name: str) -> str:
+    """Get storage and handling requirements for a drug from FDA labels.
+    Returns: temperature requirements, light sensitivity, refrigeration needs,
+    reconstitution stability, and dispensing container info."""
+    result = await external_apis.openfda_storage_conditions(drug_name)
+    if not result:
+        return json.dumps({"error": f"No storage data found for {drug_name}"})
+
+    # Parse storage keywords from how_supplied text
+    storage_summary = []
+    all_text = " ".join(result.get("how_supplied", []) + result.get("storage_and_handling", []))
+    text_lower = all_text.lower()
+
+    if "refrigerat" in text_lower or "2°c to 8°c" in text_lower or "36°f to 46°f" in text_lower:
+        storage_summary.append("REFRIGERATE (2-8°C / 36-46°F)")
+    if "room temperature" in text_lower or "20°c to 25°c" in text_lower or "68°f to 77°f" in text_lower:
+        storage_summary.append("Room temperature (20-25°C / 68-77°F)")
+    if "protect from light" in text_lower:
+        storage_summary.append("Protect from light")
+    if "protect from moisture" in text_lower:
+        storage_summary.append("Protect from moisture")
+    if "do not freeze" in text_lower:
+        storage_summary.append("Do NOT freeze")
+    if "discard" in text_lower and ("day" in text_lower or "hour" in text_lower):
+        for keyword in ["discard after", "discard within", "use within"]:
+            idx = text_lower.find(keyword)
+            if idx >= 0:
+                storage_summary.append(all_text[idx:idx+80].strip())
+                break
+
+    return json.dumps({
+        **result,
+        "storage_summary": storage_summary or ["See label text for storage details"],
+        "source": "openfda_labels",
+    })
+
+
+OTC_SYMPTOM_MAP = {
+    "headache": ["acetaminophen", "ibuprofen", "aspirin", "naproxen"],
+    "pain": ["acetaminophen", "ibuprofen", "aspirin", "naproxen"],
+    "fever": ["acetaminophen", "ibuprofen"],
+    "cold": ["pseudoephedrine", "phenylephrine", "dextromethorphan", "guaifenesin"],
+    "cough": ["dextromethorphan", "guaifenesin", "benzonatate"],
+    "allergy": ["cetirizine", "loratadine", "fexofenadine", "diphenhydramine"],
+    "hay fever": ["cetirizine", "loratadine", "fexofenadine", "fluticasone"],
+    "runny nose": ["diphenhydramine", "chlorpheniramine", "loratadine"],
+    "heartburn": ["omeprazole", "famotidine", "calcium carbonate", "ranitidine"],
+    "acid reflux": ["omeprazole", "famotidine", "esomeprazole", "lansoprazole"],
+    "stomach pain": ["bismuth subsalicylate", "calcium carbonate", "simethicone"],
+    "nausea": ["bismuth subsalicylate", "dimenhydrinate", "meclizine"],
+    "diarrhea": ["loperamide", "bismuth subsalicylate"],
+    "constipation": ["polyethylene glycol", "bisacodyl", "senna", "docusate"],
+    "insomnia": ["diphenhydramine", "doxylamine", "melatonin"],
+    "muscle pain": ["ibuprofen", "naproxen", "methyl salicylate", "menthol"],
+    "sore throat": ["benzocaine", "menthol", "phenol", "dextromethorphan"],
+    "eye allergy": ["ketotifen", "olopatadine", "naphazoline"],
+    "dry eye": ["carboxymethylcellulose", "polyethylene glycol"],
+    "nasal congestion": ["oxymetazoline", "phenylephrine", "pseudoephedrine"],
+    "skin itch": ["hydrocortisone", "diphenhydramine", "calamine"],
+    "fungal infection": ["clotrimazole", "miconazole", "terbinafine"],
+    "acne": ["benzoyl peroxide", "salicylic acid", "adapalene"],
+    "motion sickness": ["dimenhydrinate", "meclizine"],
+    "toothache": ["benzocaine", "ibuprofen", "acetaminophen"],
+}
+
+
+@mcp.tool()
+async def recommend_otc(symptom: str, patient_age_years: float = 30, avoid_drugs: list[str] | None = None) -> str:
+    """Recommend OTC (over-the-counter) drugs for common symptoms.
+    Supports: headache, pain, fever, cold, cough, allergy, heartburn, nausea,
+    diarrhea, constipation, insomnia, muscle pain, sore throat, nasal congestion,
+    skin itch, fungal infection, acne, motion sickness, toothache, and more.
+    Optionally pass drugs to avoid (e.g., patient allergies or current medications)."""
+    symptom_lower = symptom.lower().strip()
+    avoid = set(d.lower() for d in (avoid_drugs or []))
+
+    # Find matching symptoms
+    matched_drugs = []
+    for key, drugs in OTC_SYMPTOM_MAP.items():
+        if symptom_lower in key or key in symptom_lower:
+            matched_drugs.extend(drugs)
+
+    if not matched_drugs:
+        available_symptoms = sorted(OTC_SYMPTOM_MAP.keys())
+        return json.dumps({
+            "symptom": symptom,
+            "error": "No OTC recommendations for this symptom",
+            "available_symptoms": available_symptoms,
+        })
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_drugs = []
+    for d in matched_drugs:
+        if d not in seen and d.lower() not in avoid:
+            seen.add(d)
+            unique_drugs.append(d)
+
+    # Look up each drug in NDC for details
+    recommendations = []
+    for drug in unique_drugs[:6]:
+        rows = await db.query(
+            """
+            SELECT brand_name, generic_name, dosage_form, route, strength, strength_unit
+            FROM ndc_products
+            WHERE product_type = 'HUMAN OTC DRUG'
+              AND search_vector @@ plainto_tsquery('english', $1)
+            ORDER BY ts_rank(search_vector, plainto_tsquery('english', $1)) DESC
+            LIMIT 1
+            """,
+            drug,
+        )
+        rec = {"generic_name": drug}
+        if rows:
+            rec.update({
+                "brand_name": rows[0]["brand_name"],
+                "dosage_form": rows[0]["dosage_form"],
+                "strength": f"{rows[0]['strength']} {rows[0]['strength_unit']}" if rows[0]["strength"] else "",
+            })
+        recommendations.append(rec)
+
+    # Age warnings
+    warnings = []
+    if patient_age_years < 2:
+        warnings.append("Consult a pediatrician before giving any OTC medication to children under 2.")
+    if patient_age_years < 12 and "aspirin" in unique_drugs:
+        warnings.append("AVOID aspirin in children under 16 — risk of Reye's syndrome.")
+        recommendations = [r for r in recommendations if r["generic_name"] != "aspirin"]
+    if patient_age_years >= 65:
+        warnings.append("Elderly patients: use lowest effective dose. Avoid NSAIDs if possible (kidney/GI risk).")
+
+    return json.dumps({
+        "symptom": symptom,
+        "recommendations": recommendations,
+        "total": len(recommendations),
+        "avoided_drugs": list(avoid) if avoid else [],
+        "warnings": warnings,
+        "disclaimer": "OTC recommendations are for reference only. Consult a pharmacist or physician for persistent or severe symptoms.",
+    }, default=str)
+
+
 # ── Dosage Calculator Tools ──
 
 
