@@ -5,6 +5,7 @@ from itertools import combinations
 from mcp.server.fastmcp import FastMCP
 
 from heymed_mcp import db, external_apis
+from heymed_mcp.dosing_data import get_dosing, list_available_drugs
 
 mcp = FastMCP(
     "HeyMed Pharmacy AI",
@@ -495,6 +496,175 @@ async def get_special_population_dosing(drug_name: str) -> str:
         "geriatric_use": label.get("geriatric_use", []),
         "source": "openfda_labels",
     })
+
+
+# ── Dosage Calculator Tools ──
+
+
+@mcp.tool()
+async def calculate_dose(
+    drug_name: str,
+    patient_weight_kg: float = 0,
+    patient_age_years: float = 0,
+    is_pediatric: bool = False,
+) -> str:
+    """Calculate recommended dosage for a drug based on patient weight and age.
+    For pediatric patients, set is_pediatric=true and provide weight in kg.
+    Returns: recommended dose, frequency, max daily dose, available tablet sizes,
+    and how many tablets to take."""
+    dosing = get_dosing(drug_name)
+    if not dosing:
+        available = list_available_drugs()
+        return json.dumps({
+            "error": f"No dosing data for '{drug_name}'",
+            "available_drugs": available,
+            "hint": "Try get_dosing_info for FDA label text instead.",
+        })
+
+    strengths = dosing["available_strengths"]
+    result: dict = {
+        "drug_name": dosing["generic_name"],
+        "available_strengths_mg": strengths,
+    }
+
+    if is_pediatric or (patient_age_years > 0 and patient_age_years < 18):
+        ped = dosing.get("pediatric", {})
+        if not ped or not ped.get("dose_per_kg"):
+            return json.dumps({"error": f"No pediatric dosing data for {drug_name}"})
+
+        min_age_months = ped.get("min_age_months", 0)
+        age_months = patient_age_years * 12
+        if age_months < min_age_months:
+            result["warning"] = f"Not recommended under {min_age_months} months. {ped.get('notes', '')}"
+
+        if patient_weight_kg <= 0:
+            return json.dumps({"error": "Patient weight (kg) required for pediatric dosing"})
+
+        dose_mg = round(ped["dose_per_kg"] * patient_weight_kg, 1)
+        dose_low = round(ped["dose_range_per_kg"][0] * patient_weight_kg, 1)
+        dose_high = round(ped["dose_range_per_kg"][1] * patient_weight_kg, 1)
+        max_single = round(ped["max_single_dose_per_kg"] * patient_weight_kg, 1)
+        max_daily = round(ped.get("max_daily_dose_per_kg", 0) * patient_weight_kg, 1)
+
+        best_strength = _find_best_strength(dose_mg, strengths)
+        tablets = round(dose_mg / best_strength, 2) if best_strength else None
+
+        result.update({
+            "patient_type": "pediatric",
+            "weight_kg": patient_weight_kg,
+            "age_years": patient_age_years,
+            "recommended_dose_mg": dose_mg,
+            "dose_range_mg": [dose_low, dose_high],
+            "max_single_dose_mg": max_single,
+            "max_daily_dose_mg": max_daily,
+            "frequency": f"Every {ped['frequency_hours']} hours",
+            "min_frequency": f"Not more often than every {ped['min_frequency_hours']} hours",
+            "best_tablet_strength_mg": best_strength,
+            "tablets_per_dose": tablets,
+            "route": "oral",
+            "notes": ped.get("notes", ""),
+        })
+    else:
+        adult = dosing["adult"]
+        dose_mg = adult["standard_dose"]
+        best_strength = _find_best_strength(dose_mg, strengths)
+        tablets = round(dose_mg / best_strength, 2) if best_strength else None
+
+        result.update({
+            "patient_type": "adult",
+            "recommended_dose_mg": dose_mg,
+            "dose_range_mg": adult["dose_range"],
+            "max_single_dose_mg": adult["max_single_dose"],
+            "max_daily_dose_mg": adult["max_daily_dose"],
+            "max_doses_per_day": adult["max_doses_per_day"],
+            "frequency": f"Every {adult['frequency_hours']} hours",
+            "min_frequency": f"Not more often than every {adult['min_frequency_hours']} hours",
+            "best_tablet_strength_mg": best_strength,
+            "tablets_per_dose": tablets,
+            "route": adult["route"],
+            "notes": adult.get("notes", ""),
+        })
+
+    result["renal_adjustment"] = dosing.get("renal_adjustment", "")
+    result["hepatic_adjustment"] = dosing.get("hepatic_adjustment", "")
+    return json.dumps(result)
+
+
+@mcp.tool()
+async def check_max_dose(drug_name: str, dose_mg: float, doses_per_day: int, patient_weight_kg: float = 0, is_pediatric: bool = False) -> str:
+    """Check if a prescribed dose exceeds the maximum safe dose.
+    Returns whether the dose is safe, and the maximum allowed."""
+    dosing = get_dosing(drug_name)
+    if not dosing:
+        return json.dumps({"error": f"No dosing data for '{drug_name}'"})
+
+    daily_total = dose_mg * doses_per_day
+
+    if is_pediatric and patient_weight_kg > 0:
+        ped = dosing.get("pediatric", {})
+        if not ped:
+            return json.dumps({"error": f"No pediatric dosing data for {drug_name}"})
+        max_single = ped["max_single_dose_per_kg"] * patient_weight_kg
+        max_daily = ped.get("max_daily_dose_per_kg", 999) * patient_weight_kg
+        ref_type = "pediatric (weight-based)"
+    else:
+        adult = dosing["adult"]
+        max_single = adult["max_single_dose"]
+        max_daily = adult["max_daily_dose"]
+        ref_type = "adult"
+
+    single_ok = dose_mg <= max_single
+    daily_ok = daily_total <= max_daily
+
+    alerts = []
+    if not single_ok:
+        alerts.append(f"Single dose {dose_mg}mg exceeds max {max_single}mg")
+    if not daily_ok:
+        alerts.append(f"Daily total {daily_total}mg exceeds max {max_daily}mg")
+
+    return json.dumps({
+        "drug_name": dosing["generic_name"],
+        "prescribed_dose_mg": dose_mg,
+        "doses_per_day": doses_per_day,
+        "daily_total_mg": daily_total,
+        "max_single_dose_mg": round(max_single, 1),
+        "max_daily_dose_mg": round(max_daily, 1),
+        "reference_type": ref_type,
+        "single_dose_ok": single_ok,
+        "daily_dose_ok": daily_ok,
+        "overall_safe": single_ok and daily_ok,
+        "alerts": alerts,
+    })
+
+
+@mcp.tool()
+async def list_dosing_drugs() -> str:
+    """List all drugs that have structured dosing data available for calculation.
+    These drugs support calculate_dose and check_max_dose tools."""
+    drugs = list_available_drugs()
+    details = []
+    for name in drugs:
+        d = get_dosing(name)
+        if d:
+            details.append({
+                "drug_name": name,
+                "generic_name": d["generic_name"],
+                "strengths_mg": d["available_strengths"],
+                "adult_standard_dose_mg": d["adult"]["standard_dose"],
+                "adult_max_daily_mg": d["adult"]["max_daily_dose"],
+                "has_pediatric": bool(d.get("pediatric", {}).get("dose_per_kg")),
+            })
+    return json.dumps({"drugs": details, "total": len(details)})
+
+
+def _find_best_strength(target_dose: float, strengths: list[float]) -> float | None:
+    if not strengths:
+        return None
+    exact = [s for s in strengths if target_dose % s == 0]
+    if exact:
+        return max(exact)
+    below = [s for s in strengths if s <= target_dose]
+    return max(below) if below else min(strengths)
 
 
 # ── Patient Safety Tools ──
