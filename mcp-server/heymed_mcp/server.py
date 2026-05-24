@@ -28,6 +28,33 @@ Patient safety: medication records, allergy cross-reactivity, therapeutic duplic
 
 
 @mcp.tool()
+async def search_thai_fda(query: str, limit: int = 10) -> str:
+    """Search the Thai FDA (อย.) drug registration database. Contains drugs registered
+    and approved for sale in Thailand with Thai/English names, registration numbers (เลขทะเบียน อย.),
+    Thai manufacturers, drug categories (ยาอันตราย/ยาควบคุมพิเศษ/ยาสามัญประจำบ้าน), and dosage forms.
+    Use this to verify if a drug is legally registered in Thailand."""
+    rows = await db.query(
+        """
+        SELECT thai_name, english_name, registration_number, manufacturer,
+               drug_category, dosage_form, status
+        FROM thai_fda_drugs
+        WHERE search_vector @@ plainto_tsquery('simple', $1)
+           OR thai_name ILIKE $2
+           OR english_name ILIKE $2
+        ORDER BY english_name
+        LIMIT $3
+        """,
+        query, f"%{query}%", limit,
+    )
+    return json.dumps({
+        "query": query,
+        "results": rows,
+        "total": len(rows),
+        "source": "thai_fda_อย",
+    }, default=str)
+
+
+@mcp.tool()
 async def search_drugs_thai(query: str) -> str:
     """Search drugs by Thai name (ชื่อยาภาษาไทย). Translates Thai drug names to English
     and searches the FDA NDC database. Supports Thai generic names, Thai brand names,
