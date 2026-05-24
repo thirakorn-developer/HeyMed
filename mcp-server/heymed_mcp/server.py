@@ -6,6 +6,12 @@ from mcp.server.fastmcp import FastMCP
 
 from heymed_mcp import db, external_apis
 from heymed_mcp.dosing_data import get_dosing, list_available_drugs
+from heymed_mcp.triage_data import (
+    PATIENT_CONTEXT_QUESTIONS,
+    SYMPTOM_DRUG_MAP,
+    get_available_symptoms,
+    get_triage_tree,
+)
 
 mcp = FastMCP(
     "HeyMed Pharmacy AI",
@@ -496,6 +502,212 @@ async def get_special_population_dosing(drug_name: str) -> str:
         "geriatric_use": label.get("geriatric_use", []),
         "source": "openfda_labels",
     })
+
+
+# ── Symptom Assessment / Triage Tools ──
+
+
+@mcp.tool()
+async def get_triage_questions(symptom: str) -> str:
+    """Get the structured triage questions a pharmacist should ask for a given symptom.
+    Returns: ordered questions to ask the patient, red flags to watch for,
+    and when to refer to a doctor. Use this FIRST when a patient presents with a complaint.
+    Supports: headache, fever, cough, stomach pain, allergy, skin issue, eye problem."""
+    tree = get_triage_tree(symptom)
+    if not tree:
+        return json.dumps({
+            "error": f"No triage questions for '{symptom}'",
+            "available_symptoms": get_available_symptoms(),
+            "hint": "Try a broader symptom category, or use recommend_otc for direct recommendations.",
+        })
+
+    return json.dumps({
+        "symptom": tree["initial_symptom"],
+        "triage_questions": tree["questions"],
+        "patient_context_questions": PATIENT_CONTEXT_QUESTIONS,
+        "red_flags": tree["red_flags"],
+        "refer_to_doctor_if": tree["refer_if"],
+        "instructions": "Ask these questions in order. If any red flag is triggered, advise the patient to see a doctor immediately.",
+    })
+
+
+@mcp.tool()
+async def assess_symptoms(
+    symptoms: list[str],
+    patient_age_years: float = 30,
+    is_pregnant: bool = False,
+    allergies: list[str] | None = None,
+    current_medications: list[str] | None = None,
+    conditions: list[str] | None = None,
+    answers: dict | None = None,
+) -> str:
+    """Comprehensive symptom assessment tool. Takes multiple symptoms + patient context
+    and returns: recommended medications, red flags, referral advice, and safety checks.
+
+    Call this AFTER gathering info with get_triage_questions. Pass the answers dict
+    with question IDs as keys (e.g., {"severity": "moderate", "fever": "yes"}).
+
+    Example:
+      symptoms=["headache", "fever", "runny nose"]
+      patient_age_years=35
+      allergies=["aspirin"]
+      answers={"severity": "moderate", "duration": "1-2 days", "fever": "yes"}
+    """
+    allergy_set = set(a.lower() for a in (allergies or []))
+    med_set = set(m.lower() for m in (current_medications or []))
+    condition_set = set(c.lower() for c in (conditions or []))
+    answers = answers or {}
+
+    # 1. Check red flags
+    red_flags = []
+    for symptom in symptoms:
+        tree = get_triage_tree(symptom)
+        if tree:
+            for flag_key, flag_msg in tree.get("red_flags", {}).items():
+                if answers.get(flag_key, "").lower() in ("yes", "true", "1"):
+                    red_flags.append({"symptom": symptom, "flag": flag_key, "message": flag_msg})
+
+    # 2. Build drug recommendations from symptom map
+    recommended_drugs: list[dict] = []
+    notes: list[str] = []
+
+    for symptom in symptoms:
+        symptom_lower = symptom.lower()
+        drug_map = SYMPTOM_DRUG_MAP.get(symptom_lower, {})
+
+        # Determine which sub-category to use
+        severity = answers.get("severity", "mild")
+        has_fever = answers.get("fever", "").lower() in ("yes", "true")
+        cough_type = answers.get("type", "")
+
+        if symptom_lower == "headache":
+            key = "with_fever" if has_fever else severity
+        elif symptom_lower == "fever":
+            if answers.get("cough", "").lower() in ("yes", "true"):
+                key = "with_cough"
+            elif answers.get("sore_throat", "").lower() in ("yes", "true"):
+                key = "with_sore_throat"
+            elif answers.get("body_aches", "").lower() in ("yes", "true"):
+                key = "with_body_aches"
+            else:
+                key = "default"
+        elif symptom_lower == "cough":
+            if cough_type == "productive":
+                key = "productive"
+            elif answers.get("congestion", "").lower() in ("yes", "true"):
+                key = "with_congestion"
+            else:
+                key = "dry"
+        elif symptom_lower == "stomach pain":
+            eating = answers.get("eating", "")
+            if answers.get("diarrhea", "").lower() in ("yes", "true"):
+                key = "with_diarrhea"
+            elif answers.get("nausea", "").lower() in ("yes", "true"):
+                key = "with_nausea"
+            elif eating == "worse":
+                key = "upper_worse_eating"
+            else:
+                key = "upper_better_eating"
+        elif symptom_lower == "allergy":
+            symptom_list = answers.get("symptoms", "")
+            if "eye" in str(symptom_list).lower() or "itchy eyes" in str(symptom_list).lower():
+                key = "eye_symptoms"
+            elif "rash" in str(symptom_list).lower() or "hives" in str(symptom_list).lower():
+                key = "skin_rash"
+            else:
+                key = severity
+        elif symptom_lower == "skin issue":
+            skin_type = answers.get("type", "")
+            if "fungal" in skin_type.lower():
+                key = "fungal"
+            elif "dry" in skin_type.lower():
+                key = "dry_skin"
+            elif "acne" in skin_type.lower() or "spots" in skin_type.lower():
+                key = "acne"
+            else:
+                key = "itch_rash"
+        else:
+            key = severity
+
+        rec = drug_map.get(key, drug_map.get("default", drug_map.get("mild", {})))
+        if rec:
+            for drug in rec.get("drugs", []):
+                if drug.lower() not in allergy_set:
+                    recommended_drugs.append({"drug": drug, "for_symptom": symptom})
+            if rec.get("notes"):
+                notes.append(f"[{symptom}] {rec['notes']}")
+
+    # 3. Safety filters
+    safety_warnings: list[str] = []
+
+    if is_pregnant:
+        unsafe_in_pregnancy = {"ibuprofen", "naproxen", "aspirin", "dextromethorphan",
+                                "pseudoephedrine", "bismuth subsalicylate", "loperamide"}
+        before = len(recommended_drugs)
+        recommended_drugs = [d for d in recommended_drugs if d["drug"].lower() not in unsafe_in_pregnancy]
+        if len(recommended_drugs) < before:
+            safety_warnings.append("Some drugs removed — unsafe during pregnancy. Acetaminophen is generally safe.")
+
+    if patient_age_years < 12:
+        if any(d["drug"].lower() == "aspirin" for d in recommended_drugs):
+            recommended_drugs = [d for d in recommended_drugs if d["drug"].lower() != "aspirin"]
+            safety_warnings.append("Aspirin removed — risk of Reye's syndrome in children under 16.")
+    if patient_age_years < 2:
+        safety_warnings.append("Under 2 years: consult a pediatrician before any OTC medication.")
+
+    if patient_age_years >= 65:
+        if any(d["drug"].lower() in ("ibuprofen", "naproxen") for d in recommended_drugs):
+            safety_warnings.append("Elderly: use NSAIDs with caution — increased risk of GI bleeding and kidney injury.")
+
+    if "asthma" in condition_set:
+        if any(d["drug"].lower() in ("aspirin", "ibuprofen", "naproxen") for d in recommended_drugs):
+            safety_warnings.append("Asthma: NSAIDs/aspirin may trigger bronchospasm. Prefer acetaminophen.")
+
+    if "kidney disease" in condition_set or "renal" in " ".join(condition_set):
+        if any(d["drug"].lower() in ("ibuprofen", "naproxen") for d in recommended_drugs):
+            safety_warnings.append("Kidney disease: AVOID NSAIDs — may worsen renal function.")
+
+    # 4. Deduplicate recommendations
+    seen = set()
+    unique_recs = []
+    for d in recommended_drugs:
+        if d["drug"] not in seen:
+            seen.add(d["drug"])
+            unique_recs.append(d)
+
+    # 5. Check interactions with current medications
+    interaction_warnings = []
+    if current_medications and unique_recs:
+        for rec_drug in unique_recs[:3]:
+            for current_med in current_medications[:5]:
+                result = await external_apis.openfda_interaction_check(rec_drug["drug"], current_med)
+                if result:
+                    interaction_warnings.append({
+                        "recommended": rec_drug["drug"],
+                        "current_med": current_med,
+                        "severity": result.get("severity", "unknown"),
+                        "total_labels": result["total_labels"],
+                    })
+
+    should_refer = len(red_flags) > 0
+
+    return json.dumps({
+        "symptoms": symptoms,
+        "patient_profile": {
+            "age": patient_age_years,
+            "pregnant": is_pregnant,
+            "allergies": list(allergy_set),
+            "current_medications": list(med_set),
+            "conditions": list(condition_set),
+        },
+        "red_flags": red_flags,
+        "should_refer_to_doctor": should_refer,
+        "recommendations": unique_recs,
+        "clinical_notes": notes,
+        "safety_warnings": safety_warnings,
+        "interaction_warnings": interaction_warnings,
+        "disclaimer": "This is a clinical decision support tool. Pharmacist professional judgment is required for final recommendation.",
+    }, default=str)
 
 
 # ── Food Interactions, Storage & OTC Tools ──
