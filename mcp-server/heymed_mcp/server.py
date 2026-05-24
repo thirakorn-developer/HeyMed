@@ -6,6 +6,7 @@ from mcp.server.fastmcp import FastMCP
 
 from heymed_mcp import db, external_apis
 from heymed_mcp.dosing_data import get_dosing, list_available_drugs
+from heymed_mcp.thai_drug_names import search_thai_drugs, translate_thai_to_english
 from heymed_mcp.triage_data import (
     PATIENT_CONTEXT_QUESTIONS,
     SYMPTOM_DRUG_MAP,
@@ -27,10 +28,54 @@ Patient safety: medication records, allergy cross-reactivity, therapeutic duplic
 
 
 @mcp.tool()
+async def search_drugs_thai(query: str) -> str:
+    """Search drugs by Thai name (ชื่อยาภาษาไทย). Translates Thai drug names to English
+    and searches the FDA NDC database. Supports Thai generic names, Thai brand names,
+    and common abbreviations (e.g., ยาพารา, ยาแก้แพ้, ยาลดไข้, อะม็อกซี่)."""
+    # Direct Thai mapping
+    thai_results = search_thai_drugs(query)
+    if not thai_results:
+        return json.dumps({
+            "query": query,
+            "results": [],
+            "message": f"No Thai drug name match for '{query}'. Try English name or use search_drugs_ndc.",
+        })
+
+    english_name = thai_results[0]["english_name"]
+    rows = await db.query(
+        """
+        SELECT product_ndc, brand_name, generic_name, dosage_form, route,
+               substance_name, strength, strength_unit, labeler_name,
+               product_type, dea_schedule, pharm_classes
+        FROM ndc_products
+        WHERE search_vector @@ plainto_tsquery('english', $1)
+        ORDER BY ts_rank(search_vector, plainto_tsquery('english', $1)) DESC
+        LIMIT 5
+        """,
+        english_name,
+    )
+    return json.dumps({
+        "query": query,
+        "translated_to": english_name,
+        "thai_matches": thai_results[:5],
+        "products": rows,
+        "total": len(rows),
+        "source": "fda_ndc_local (thai→english)",
+    }, default=str)
+
+
+@mcp.tool()
 async def search_drugs_ndc(query: str, limit: int = 10) -> str:
     """Search the FDA NDC Directory (113K+ products) by drug name, brand name, or ingredient.
     Returns brand/generic name, dosage form, strength, route, manufacturer, and pharmacological class.
-    Use this as the primary drug search — it's fast (local database) and comprehensive."""
+    Use this as the primary drug search — it's fast (local database) and comprehensive.
+    Also supports Thai drug names (ชื่อยาภาษาไทย) — auto-translates to English."""
+    # Auto-detect Thai input and translate
+    thai_translation = translate_thai_to_english(query)
+    original_query = query
+    if thai_translation:
+        query = thai_translation
+
     rows = await db.query(
         """
         SELECT product_ndc, brand_name, generic_name, dosage_form, route,
@@ -44,8 +89,12 @@ async def search_drugs_ndc(query: str, limit: int = 10) -> str:
         query, limit,
     )
     if not rows:
-        return json.dumps({"results": [], "hint": "No local results. Try search_drugs_rxnorm."})
-    return json.dumps({"results": rows, "total": len(rows), "source": "fda_ndc_local"}, default=str)
+        return json.dumps({"results": [], "hint": "No local results. Try search_drugs_rxnorm or search_drugs_thai."})
+    result = {"results": rows, "total": len(rows), "source": "fda_ndc_local"}
+    if thai_translation:
+        result["thai_input"] = original_query
+        result["translated_to"] = thai_translation
+    return json.dumps(result, default=str)
 
 
 @mcp.tool()
