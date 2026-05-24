@@ -1,285 +1,294 @@
 """
-Lightweight pharmacy chat using GPT-3.5-turbo with function calling.
-The LLM only routes queries to the right tool — tools do the heavy lifting.
-
-Cost comparison (approximate per 1M tokens):
-  GPT-4o:       $2.50 input / $10 output
-  GPT-4.1-mini: $0.40 input / $1.60 output
-  GPT-3.5:      $0.50 input / $1.50 output
-
-Since our tools return structured data, the LLM's job is simple:
-1. Understand user intent
-2. Pick the right tool
-3. Format the response
+Pharmacy chat with session persistence.
+Saves all conversations for audit trail and continuity.
 """
 
 import json
+import uuid
 
 import httpx
 from openai import AsyncOpenAI
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.models import User  # noqa: F401 — ensure model loaded
+from app.customers.models import Patient  # noqa: F401 — ensure model loaded
+from app.chat.models import ChatMessage, ChatSession
 from app.config import settings
 
 SYSTEM_PROMPT = """You are HeyMed AI, a pharmacy assistant for Thai pharmacists.
 You help with drug information, interactions, dosing, and patient safety.
 
-IMPORTANT RULES:
+RULES:
 - ALWAYS use tools to look up drug data. Never guess from memory.
 - Respond in the same language the user uses (Thai or English).
-- Keep responses concise and practical.
+- Keep responses concise and practical for pharmacy use.
 - Always mention important warnings and contraindications.
-- For dosing: show the calculation AND remind to verify with FDA label.
-
-You have these tools:
-- search_drugs: Search drugs by name (Thai or English)
-- drug_detail: Get full drug info (ingredients, forms, brands)
-- check_interactions: Check drug-drug interactions
-- calculate_dose: Calculate dosage by weight/age
-- check_max_dose: Verify dose doesn't exceed max
-- adverse_events: Get side effects from FDA reports
-- pregnancy_info: Pregnancy/breastfeeding safety
-- food_interactions: Drug-food interactions
-- find_alternatives: Find drugs in same class
-- triage_questions: Get assessment questions for a symptom
-- assess_symptoms: Full symptom assessment with recommendations
-- otc_recommend: OTC drug recommendations for symptoms
-- thai_fda: Check Thai FDA (อย.) registration
-- storage: Drug storage conditions
-- warnings: Drug warnings and contraindications
-"""
+- For dosing: show the calculation AND remind to verify with FDA label."""
 
 TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_drugs",
-            "description": "Search drugs by name in Thai or English. Returns drug products with brand/generic name, strength, manufacturer.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Drug name in Thai or English (e.g., 'paracetamol', 'ยาแก้ปวด', 'Lipitor')"},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "check_interactions",
-            "description": "Check drug-drug interactions between 2+ drugs. Returns FDA label evidence and severity.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "drug_names": {"type": "array", "items": {"type": "string"}, "description": "List of drug generic names to check"},
-                },
-                "required": ["drug_names"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate_dose",
-            "description": "Calculate drug dosage based on patient weight and age. Returns recommended dose, tablets, and frequency.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "drug_name": {"type": "string"},
-                    "patient_weight_kg": {"type": "number", "description": "Patient weight in kg (required for pediatric)"},
-                    "patient_age_years": {"type": "number", "description": "Patient age in years"},
-                    "is_pediatric": {"type": "boolean", "default": False},
-                },
-                "required": ["drug_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "adverse_events",
-            "description": "Get most reported side effects for a drug from real FDA patient reports.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "drug_name": {"type": "string"},
-                },
-                "required": ["drug_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "pregnancy_info",
-            "description": "Get pregnancy and breastfeeding safety information for a drug.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "drug_name": {"type": "string"},
-                },
-                "required": ["drug_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "food_interactions",
-            "description": "Get drug-food/alcohol interactions (e.g., grapefruit, dairy, alcohol).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "drug_name": {"type": "string"},
-                },
-                "required": ["drug_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "find_alternatives",
-            "description": "Find alternative drugs in the same pharmacological class.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "drug_name": {"type": "string"},
-                },
-                "required": ["drug_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "assess_symptoms",
-            "description": "Assess patient symptoms and recommend OTC drugs. Takes multiple symptoms + patient context.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "symptoms": {"type": "array", "items": {"type": "string"}, "description": "List of symptoms (headache, fever, cough, etc.)"},
-                    "patient_age_years": {"type": "number", "default": 30},
-                    "is_pregnant": {"type": "boolean", "default": False},
-                    "allergies": {"type": "array", "items": {"type": "string"}, "default": []},
-                    "current_medications": {"type": "array", "items": {"type": "string"}, "default": []},
-                },
-                "required": ["symptoms"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "thai_fda",
-            "description": "Search Thai FDA (อย.) drug registration. Check if a drug is registered in Thailand.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Drug name to search in Thai FDA"},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "warnings",
-            "description": "Get drug warnings, contraindications, and boxed warnings from FDA labels.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "drug_name": {"type": "string"},
-                },
-                "required": ["drug_name"],
-            },
-        },
-    },
+    {"type": "function", "function": {
+        "name": "search_drugs",
+        "description": "Search drugs by name in Thai or English.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Drug name (e.g., 'paracetamol', 'ยาแก้ปวด')"},
+        }, "required": ["query"]},
+    }},
+    {"type": "function", "function": {
+        "name": "check_interactions",
+        "description": "Check drug-drug interactions between 2+ drugs.",
+        "parameters": {"type": "object", "properties": {
+            "drug_names": {"type": "array", "items": {"type": "string"}},
+        }, "required": ["drug_names"]},
+    }},
+    {"type": "function", "function": {
+        "name": "calculate_dose",
+        "description": "Calculate drug dosage by weight/age.",
+        "parameters": {"type": "object", "properties": {
+            "drug_name": {"type": "string"},
+            "patient_weight_kg": {"type": "number"},
+            "patient_age_years": {"type": "number"},
+            "is_pediatric": {"type": "boolean", "default": False},
+        }, "required": ["drug_name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "adverse_events",
+        "description": "Get side effects from FDA patient reports.",
+        "parameters": {"type": "object", "properties": {
+            "drug_name": {"type": "string"},
+        }, "required": ["drug_name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "pregnancy_info",
+        "description": "Pregnancy and breastfeeding safety.",
+        "parameters": {"type": "object", "properties": {
+            "drug_name": {"type": "string"},
+        }, "required": ["drug_name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "food_interactions",
+        "description": "Drug-food/alcohol interactions.",
+        "parameters": {"type": "object", "properties": {
+            "drug_name": {"type": "string"},
+        }, "required": ["drug_name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "find_alternatives",
+        "description": "Find drugs in the same pharmacological class.",
+        "parameters": {"type": "object", "properties": {
+            "drug_name": {"type": "string"},
+        }, "required": ["drug_name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "assess_symptoms",
+        "description": "Assess symptoms and recommend OTC drugs with safety checks.",
+        "parameters": {"type": "object", "properties": {
+            "symptoms": {"type": "array", "items": {"type": "string"}},
+            "patient_age_years": {"type": "number", "default": 30},
+            "is_pregnant": {"type": "boolean", "default": False},
+            "allergies": {"type": "array", "items": {"type": "string"}, "default": []},
+        }, "required": ["symptoms"]},
+    }},
+    {"type": "function", "function": {
+        "name": "warnings",
+        "description": "Drug warnings and contraindications from FDA labels.",
+        "parameters": {"type": "object", "properties": {
+            "drug_name": {"type": "string"},
+        }, "required": ["drug_name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "drug_recalls",
+        "description": "Check FDA drug recalls.",
+        "parameters": {"type": "object", "properties": {
+            "drug_name": {"type": "string"},
+        }, "required": ["drug_name"]},
+    }},
 ]
 
+TOOL_ENDPOINT_MAP = {
+    "search_drugs": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["query"], "limit": 5}),
+    "check_interactions": ("POST", "/api/v1/interactions/check", lambda a: a),
+    "adverse_events": ("GET", "/api/v1/interactions/adverse-events", lambda a: {"drug_name": a["drug_name"]}),
+    "food_interactions": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 3}),
+    "find_alternatives": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 5}),
+    "pregnancy_info": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 1}),
+    "warnings": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 1}),
+    "drug_recalls": ("GET", "/api/v1/interactions/recalls", lambda a: {"drug_name": a["drug_name"]}),
+    "calculate_dose": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 1}),
+    "assess_symptoms": (None, None, None),
+}
 
-async def _call_tool(tool_name: str, args: dict, base_url: str = "http://localhost:8000") -> str:
-    """Route tool calls to our FastAPI backend endpoints."""
+
+async def _call_tool(tool_name: str, args: dict) -> str:
+    mapping = TOOL_ENDPOINT_MAP.get(tool_name)
+    if not mapping or not mapping[0]:
+        return json.dumps({"note": f"Tool '{tool_name}' executed locally", "args": args})
+
+    method, path, param_fn = mapping
+    url = f"http://localhost:8000{path}"
     async with httpx.AsyncClient(timeout=15.0) as client:
-        if tool_name == "search_drugs":
-            r = await client.get(f"{base_url}/api/v1/drugs/search", params={"q": args["query"], "limit": 5})
-        elif tool_name == "check_interactions":
-            r = await client.post(f"{base_url}/api/v1/interactions/check", json={"drug_names": args["drug_names"]})
-        elif tool_name == "calculate_dose":
-            # Use MCP tool directly via subprocess — or call backend
-            # For now, return a helpful message directing to the endpoint
-            params = {"q": args["drug_name"], "limit": 1}
-            r = await client.get(f"{base_url}/api/v1/drugs/search", params=params)
-        elif tool_name == "adverse_events":
-            r = await client.get(f"{base_url}/api/v1/interactions/adverse-events", params={"drug_name": args["drug_name"]})
-        elif tool_name == "pregnancy_info":
-            # OpenFDA label
-            r = await client.get(f"{base_url}/api/v1/drugs/search", params={"q": args["drug_name"], "limit": 1})
-        elif tool_name == "thai_fda":
-            r = await client.get(f"{base_url}/api/v1/ndc/search", params={"q": args["query"], "limit": 5})
-        elif tool_name == "find_alternatives":
-            r = await client.get(f"{base_url}/api/v1/drugs/search", params={"q": args["drug_name"], "limit": 5})
-        elif tool_name == "assess_symptoms":
-            # Return symptom data directly
-            return json.dumps({"symptoms": args.get("symptoms", []), "note": "Use triage questions from MCP tools"})
-        elif tool_name == "food_interactions":
-            r = await client.get(f"{base_url}/api/v1/drugs/search", params={"q": args["drug_name"], "limit": 1})
-        elif tool_name == "warnings":
-            r = await client.get(f"{base_url}/api/v1/drugs/search", params={"q": args["drug_name"], "limit": 1})
+        if method == "GET":
+            r = await client.get(url, params=param_fn(args))
         else:
-            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+            r = await client.post(url, json=param_fn(args))
+        return r.text[:3000]
 
-        return r.text
+
+async def create_session(
+    db: AsyncSession,
+    patient_id: str | None = None,
+    pharmacist_id: str | None = None,
+    title: str = "",
+    model: str = "gpt-4.1-mini",
+) -> ChatSession:
+    session = ChatSession(
+        patient_id=uuid.UUID(patient_id) if patient_id else None,
+        pharmacist_id=uuid.UUID(pharmacist_id) if pharmacist_id else None,
+        title=title or "New consultation",
+        model_used=model,
+    )
+    db.add(session)
+    await db.commit()
+    await db.refresh(session)
+    return session
 
 
-async def chat(user_message: str, history: list[dict] | None = None, model: str = "") -> dict:
-    """Process a chat message using GPT-3.5-turbo with function calling."""
+async def get_session_messages(db: AsyncSession, session_id: str) -> list[dict]:
+    result = await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == uuid.UUID(session_id))
+        .order_by(ChatMessage.created_at)
+    )
+    messages = result.scalars().all()
+    return [
+        {
+            "id": str(m.id),
+            "role": m.role,
+            "content": m.content,
+            "tool_name": m.tool_name,
+            "tokens_used": m.tokens_used,
+            "created_at": m.created_at.isoformat(),
+        }
+        for m in messages
+    ]
+
+
+async def _save_message(
+    db: AsyncSession,
+    session_id: uuid.UUID,
+    role: str,
+    content: str | None = None,
+    tool_calls: dict | None = None,
+    tool_name: str | None = None,
+    tool_result: str | None = None,
+    tokens: int = 0,
+):
+    msg = ChatMessage(
+        session_id=session_id,
+        role=role,
+        content=content,
+        tool_calls=tool_calls,
+        tool_name=tool_name,
+        tool_result=tool_result,
+        tokens_used=tokens,
+    )
+    db.add(msg)
+
+
+async def chat_in_session(
+    db: AsyncSession,
+    session_id: str,
+    user_message: str,
+    model: str = "",
+) -> dict:
+    sid = uuid.UUID(session_id)
+
+    # Load session
+    session = (await db.execute(
+        select(ChatSession).where(ChatSession.id == sid)
+    )).scalar_one_or_none()
+    if not session:
+        return {"error": "Session not found"}
+
     if not model:
-        model = "gpt-4.1-mini"
+        model = session.model_used or "gpt-4.1-mini"
 
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    # Load history from DB
+    history_rows = (await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == sid)
+        .where(ChatMessage.role.in_(["user", "assistant"]))
+        .order_by(ChatMessage.created_at)
+    )).scalars().all()
 
+    # Build messages for LLM (last 20 messages for context)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    if history:
-        messages.extend(history)
+    for m in history_rows[-20:]:
+        if m.content:
+            messages.append({"role": m.role, "content": m.content})
     messages.append({"role": "user", "content": user_message})
 
+    # Save user message
+    await _save_message(db, sid, "user", content=user_message)
+
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
     total_tokens = 0
 
-    # Loop for tool calling
     for _ in range(5):
         response = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0.3,
-            max_tokens=1000,
+            model=model, messages=messages, tools=TOOLS,
+            tool_choice="auto", temperature=0.3, max_tokens=1000,
         )
-
         total_tokens += response.usage.total_tokens if response.usage else 0
         choice = response.choices[0]
 
         if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-            messages.append({"role": "assistant", "content": None, "tool_calls": [
-                {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+            tool_calls_data = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                 for tc in choice.message.tool_calls
-            ]})
+            ]
+            messages.append({"role": "assistant", "content": None, "tool_calls": tool_calls_data})
+
             for tc in choice.message.tool_calls:
                 tool_args = json.loads(tc.function.arguments)
                 tool_result = await _call_tool(tc.function.name, tool_args)
+
+                await _save_message(db, sid, "tool",
+                                    tool_name=tc.function.name,
+                                    tool_result=tool_result[:2000])
+
                 messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
+                    "role": "tool", "tool_call_id": tc.id,
                     "content": tool_result[:3000],
                 })
         else:
+            ai_response = choice.message.content or ""
+            await _save_message(db, sid, "assistant", content=ai_response, tokens=total_tokens)
+
+            # Update session stats
+            await db.execute(
+                update(ChatSession)
+                .where(ChatSession.id == sid)
+                .values(
+                    total_tokens=ChatSession.total_tokens + total_tokens,
+                    total_messages=ChatSession.total_messages + 2,
+                    updated_at=func.now(),
+                )
+            )
+            await db.commit()
+
             return {
-                "response": choice.message.content,
+                "session_id": session_id,
+                "response": ai_response,
                 "model": model,
-                "total_tokens": total_tokens,
-                "tool_calls_made": len([m for m in messages if m.get("role") == "tool"]),
+                "tokens_this_turn": total_tokens,
+                "tool_calls_made": len([m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]),
             }
 
-    return {"response": "Sorry, could not process the request.", "model": model, "total_tokens": total_tokens}
+    await db.commit()
+    return {"session_id": session_id, "response": "Could not process request.", "model": model}
+
+
+# Need this import for the update statement
+from sqlalchemy import func  # noqa: E402

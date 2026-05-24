@@ -13,6 +13,7 @@ from app.auth.models import User  # noqa: F401
 from app.drugs.models import RxnConcept, RxnRelationship, RxnAttribute  # noqa: F401
 from app.drugs.ndc_models import NdcProduct, NdcPackage  # noqa: F401
 from app.customers.models import Patient, PatientMedication, PatientAllergy  # noqa: F401
+from app.chat.models import ChatSession, ChatMessage  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url)
