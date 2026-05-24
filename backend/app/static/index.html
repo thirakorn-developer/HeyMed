@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HeyMed - Pharmacy AI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .chat-bubble { max-width: 85%; }
+        .tool-badge { font-size: 0.65rem; }
+        #chat-messages { scroll-behavior: smooth; }
+        .typing-indicator span { animation: bounce 1.4s infinite; }
+        .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+        .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes bounce { 0%,80%,100%{transform:translateY(0)} 40%{transform:translateY(-6px)} }
+        .tab-active { border-bottom: 2px solid #2563eb; color: #2563eb; font-weight: 600; }
+    </style>
+</head>
+<body class="bg-gray-50 h-screen flex flex-col">
+    <!-- Header -->
+    <header class="bg-white border-b px-4 py-3 flex items-center justify-between shadow-sm">
+        <div class="flex items-center gap-3">
+            <div class="w-9 h-9 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold text-sm">HM</div>
+            <div>
+                <h1 class="text-lg font-bold text-gray-800">HeyMed</h1>
+                <p class="text-xs text-gray-500">Pharmacy AI Assistant</p>
+            </div>
+        </div>
+        <div class="flex items-center gap-2">
+            <select id="model-select" class="text-xs border rounded-lg px-2 py-1.5 bg-white">
+                <option value="gpt-4.1-nano">GPT-4.1 Nano (cheapest)</option>
+                <option value="gpt-4.1-mini" selected>GPT-4.1 Mini (recommended)</option>
+                <option value="gpt-4o-mini">GPT-4o Mini</option>
+            </select>
+            <span id="token-counter" class="text-xs text-gray-400">0 tokens</span>
+        </div>
+    </header>
+
+    <!-- Tabs -->
+    <div class="bg-white border-b flex px-4">
+        <button onclick="switchTab('chat')" id="tab-chat" class="px-4 py-2.5 text-sm tab-active">Chat</button>
+        <button onclick="switchTab('search')" id="tab-search" class="px-4 py-2.5 text-sm text-gray-500 hover:text-gray-700">Drug Search</button>
+        <button onclick="switchTab('interactions')" id="tab-interactions" class="px-4 py-2.5 text-sm text-gray-500 hover:text-gray-700">Interactions</button>
+        <button onclick="switchTab('sessions')" id="tab-sessions" class="px-4 py-2.5 text-sm text-gray-500 hover:text-gray-700">Sessions</button>
+    </div>
+
+    <!-- Chat Tab -->
+    <div id="panel-chat" class="flex-1 flex flex-col overflow-hidden">
+        <!-- Session Info Bar -->
+        <div id="session-bar" class="bg-blue-50 px-4 py-2 text-xs text-blue-700 flex items-center justify-between hidden">
+            <span id="session-info"></span>
+            <button onclick="newSession()" class="bg-blue-100 hover:bg-blue-200 px-2 py-1 rounded text-blue-700">+ New Session</button>
+        </div>
+
+        <!-- Messages -->
+        <div id="chat-messages" class="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+            <div class="text-center text-gray-400 text-sm py-8">
+                <div class="text-3xl mb-2">&#x1F48A;</div>
+                <p class="font-medium text-gray-600">Welcome to HeyMed</p>
+                <p>Pharmacy AI Assistant - ask about drugs, dosing, interactions</p>
+                <div class="mt-4 flex flex-wrap gap-2 justify-center">
+                    <button onclick="quickAsk('ยาพาราเซตามอลเด็ก 25 กก. กินยังไง')" class="bg-white border rounded-full px-3 py-1.5 text-xs hover:bg-gray-50">Paracetamol dosing</button>
+                    <button onclick="quickAsk('aspirin กับ warfarin ใช้ด้วยกันได้ไหม')" class="bg-white border rounded-full px-3 py-1.5 text-xs hover:bg-gray-50">Drug interaction</button>
+                    <button onclick="quickAsk('ลูกค้าปวดหัว มีไข้ แนะนำยาอะไร')" class="bg-white border rounded-full px-3 py-1.5 text-xs hover:bg-gray-50">OTC recommendation</button>
+                    <button onclick="quickAsk('warfarin กินกับส้มโอได้ไหม')" class="bg-white border rounded-full px-3 py-1.5 text-xs hover:bg-gray-50">Food interaction</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Input -->
+        <div class="bg-white border-t px-4 py-3">
+            <form onsubmit="sendMessage(event)" class="flex gap-2">
+                <input id="chat-input" type="text" placeholder="Ask about drugs, dosing, interactions... (Thai or English)"
+                    class="flex-1 border rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" autocomplete="off">
+                <button type="submit" id="send-btn" class="bg-blue-600 text-white px-5 py-2.5 rounded-xl text-sm font-medium hover:bg-blue-700 disabled:opacity-50">
+                    Send
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Drug Search Tab -->
+    <div id="panel-search" class="flex-1 flex flex-col overflow-hidden hidden">
+        <div class="px-4 py-3">
+            <form onsubmit="searchDrug(event)" class="flex gap-2">
+                <input id="drug-search-input" type="text" placeholder="Search drug name (Thai or English)..."
+                    class="flex-1 border rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <button type="submit" class="bg-green-600 text-white px-5 py-2.5 rounded-xl text-sm font-medium hover:bg-green-700">Search</button>
+            </form>
+        </div>
+        <div id="search-results" class="flex-1 overflow-y-auto px-4 pb-4">
+            <p class="text-center text-gray-400 text-sm py-8">Search for a drug to see results</p>
+        </div>
+    </div>
+
+    <!-- Interactions Tab -->
+    <div id="panel-interactions" class="flex-1 flex flex-col overflow-hidden hidden">
+        <div class="px-4 py-3">
+            <form onsubmit="checkInteractions(event)">
+                <p class="text-sm text-gray-600 mb-2">Enter drug names (one per line):</p>
+                <textarea id="interaction-input" rows="3" placeholder="aspirin&#10;warfarin&#10;ibuprofen"
+                    class="w-full border rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"></textarea>
+                <button type="submit" class="mt-2 bg-red-600 text-white px-5 py-2.5 rounded-xl text-sm font-medium hover:bg-red-700 w-full">
+                    Check Interactions
+                </button>
+            </form>
+        </div>
+        <div id="interaction-results" class="flex-1 overflow-y-auto px-4 pb-4"></div>
+    </div>
+
+    <!-- Sessions Tab -->
+    <div id="panel-sessions" class="flex-1 flex flex-col overflow-hidden hidden">
+        <div class="px-4 py-3 flex justify-between items-center">
+            <h2 class="font-medium text-gray-700">Chat Sessions</h2>
+            <button onclick="newSession()" class="bg-blue-600 text-white px-4 py-2 rounded-xl text-sm hover:bg-blue-700">+ New Session</button>
+        </div>
+        <div id="sessions-list" class="flex-1 overflow-y-auto px-4 pb-4 space-y-2"></div>
+    </div>
+
+<script>
+const API = '';
+let currentSessionId = null;
+let totalTokens = 0;
+
+// Tab switching
+function switchTab(tab) {
+    ['chat','search','interactions','sessions'].forEach(t => {
+        document.getElementById(`panel-${t}`).classList.toggle('hidden', t !== tab);
+        document.getElementById(`tab-${t}`).classList.toggle('tab-active', t === tab);
+        if (t !== tab) document.getElementById(`tab-${t}`).classList.add('text-gray-500');
+        else document.getElementById(`tab-${t}`).classList.remove('text-gray-500');
+    });
+    if (tab === 'sessions') loadSessions();
+}
+
+// Chat
+async function sendMessage(e) {
+    e && e.preventDefault();
+    const input = document.getElementById('chat-input');
+    const msg = input.value.trim();
+    if (!msg) return;
+    input.value = '';
+
+    if (!currentSessionId) await createSession();
+
+    addMessage('user', msg);
+    showTyping();
+
+    try {
+        const model = document.getElementById('model-select').value;
+        const res = await fetch(`${API}/api/v1/chat/sessions/${currentSessionId}/messages`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({message: msg, model}),
+        });
+        const data = await res.json();
+        hideTyping();
+
+        if (data.response) {
+            addMessage('assistant', data.response, data.tool_calls_made);
+            totalTokens += data.tokens_this_turn || 0;
+            document.getElementById('token-counter').textContent = `${totalTokens.toLocaleString()} tokens`;
+        } else if (data.error) {
+            addMessage('system', 'Error: ' + data.error);
+        }
+    } catch (err) {
+        hideTyping();
+        addMessage('system', 'Connection error: ' + err.message);
+    }
+}
+
+function quickAsk(text) {
+    document.getElementById('chat-input').value = text;
+    sendMessage();
+}
+
+function addMessage(role, content, toolCalls) {
+    const container = document.getElementById('chat-messages');
+    const div = document.createElement('div');
+
+    if (role === 'user') {
+        div.className = 'flex justify-end';
+        div.innerHTML = `<div class="chat-bubble bg-blue-600 text-white rounded-2xl rounded-br-sm px-4 py-2.5 text-sm">${escapeHtml(content)}</div>`;
+    } else if (role === 'assistant') {
+        const toolBadge = toolCalls ? `<span class="tool-badge bg-green-100 text-green-700 px-1.5 py-0.5 rounded">${toolCalls} tool(s) used</span>` : '';
+        div.className = 'flex justify-start';
+        div.innerHTML = `<div class="chat-bubble bg-white border rounded-2xl rounded-bl-sm px-4 py-2.5 text-sm shadow-sm">
+            <div class="whitespace-pre-wrap">${formatResponse(content)}</div>
+            ${toolBadge ? `<div class="mt-2 flex gap-1">${toolBadge}</div>` : ''}
+        </div>`;
+    } else {
+        div.className = 'flex justify-center';
+        div.innerHTML = `<div class="text-xs text-red-500 bg-red-50 px-3 py-1 rounded-full">${escapeHtml(content)}</div>`;
+    }
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+}
+
+function showTyping() {
+    const container = document.getElementById('chat-messages');
+    const div = document.createElement('div');
+    div.id = 'typing';
+    div.className = 'flex justify-start';
+    div.innerHTML = `<div class="typing-indicator bg-white border rounded-2xl px-4 py-3 shadow-sm">
+        <span class="inline-block w-2 h-2 bg-gray-400 rounded-full mx-0.5"></span>
+        <span class="inline-block w-2 h-2 bg-gray-400 rounded-full mx-0.5"></span>
+        <span class="inline-block w-2 h-2 bg-gray-400 rounded-full mx-0.5"></span>
+    </div>`;
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+    document.getElementById('send-btn').disabled = true;
+}
+
+function hideTyping() {
+    const el = document.getElementById('typing');
+    if (el) el.remove();
+    document.getElementById('send-btn').disabled = false;
+}
+
+// Sessions
+async function createSession(title) {
+    const res = await fetch(`${API}/api/v1/chat/sessions`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({title: title || 'New consultation'}),
+    });
+    const data = await res.json();
+    currentSessionId = data.session_id;
+    document.getElementById('session-bar').classList.remove('hidden');
+    document.getElementById('session-info').textContent = `Session: ${data.title} (${new Date(data.created_at).toLocaleTimeString('th-TH')})`;
+    return data;
+}
+
+function newSession() {
+    currentSessionId = null;
+    totalTokens = 0;
+    document.getElementById('token-counter').textContent = '0 tokens';
+    document.getElementById('chat-messages').innerHTML = '';
+    document.getElementById('session-bar').classList.add('hidden');
+    switchTab('chat');
+}
+
+async function loadSessions() {
+    try {
+        const res = await fetch(`${API}/api/v1/chat/sessions?limit=20`);
+        const data = await res.json();
+        const container = document.getElementById('sessions-list');
+        if (!data.sessions || data.sessions.length === 0) {
+            container.innerHTML = '<p class="text-center text-gray-400 py-8">No sessions yet</p>';
+            return;
+        }
+        container.innerHTML = data.sessions.map(s => `
+            <div onclick="loadSession('${s.session_id}')" class="bg-white border rounded-xl p-3 cursor-pointer hover:bg-gray-50">
+                <div class="flex justify-between items-start">
+                    <div>
+                        <p class="font-medium text-sm text-gray-800">${escapeHtml(s.title)}</p>
+                        <p class="text-xs text-gray-500 mt-1">${s.total_messages} messages | ${s.total_tokens.toLocaleString()} tokens</p>
+                    </div>
+                    <span class="text-xs text-gray-400">${new Date(s.updated_at).toLocaleDateString('th-TH')}</span>
+                </div>
+            </div>
+        `).join('');
+    } catch (err) {
+        document.getElementById('sessions-list').innerHTML = '<p class="text-center text-red-400 py-4">Error loading sessions</p>';
+    }
+}
+
+async function loadSession(id) {
+    currentSessionId = id;
+    const res = await fetch(`${API}/api/v1/chat/sessions/${id}`);
+    const data = await res.json();
+
+    document.getElementById('chat-messages').innerHTML = '';
+    document.getElementById('session-bar').classList.remove('hidden');
+    document.getElementById('session-info').textContent = `Session: ${id.substring(0,8)}...`;
+
+    for (const m of data.messages) {
+        if (m.role === 'user' || m.role === 'assistant') {
+            addMessage(m.role, m.content || '');
+        }
+    }
+    switchTab('chat');
+}
+
+// Drug Search
+async function searchDrug(e) {
+    e.preventDefault();
+    const query = document.getElementById('drug-search-input').value.trim();
+    if (!query) return;
+
+    document.getElementById('search-results').innerHTML = '<p class="text-center text-gray-400 py-4">Searching...</p>';
+
+    try {
+        const res = await fetch(`${API}/api/v1/drugs/search?q=${encodeURIComponent(query)}&limit=10`);
+        const data = await res.json();
+        const container = document.getElementById('search-results');
+
+        if (!data.results || data.results.length === 0) {
+            container.innerHTML = `<p class="text-center text-gray-400 py-4">No results for "${escapeHtml(query)}"</p>`;
+            return;
+        }
+
+        container.innerHTML = `
+            <p class="text-xs text-gray-500 mb-2">${data.total} results ${data.source ? `(${data.source})` : ''} ${data.translated_to ? `| Thai → ${data.translated_to}` : ''}</p>
+            ${data.results.map(d => `
+                <div class="bg-white border rounded-xl p-3 mb-2">
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <p class="font-medium text-sm">${escapeHtml(d.name || d.brand_name || '')}</p>
+                            <p class="text-xs text-gray-500">${escapeHtml(d.generic_name || '')} ${d.dosage_form ? `| ${d.dosage_form}` : ''}</p>
+                            ${d.strength ? `<p class="text-xs text-gray-400">${d.strength} ${d.strength_unit || ''}</p>` : ''}
+                            ${d.labeler_name ? `<p class="text-xs text-gray-400">${escapeHtml(d.labeler_name)}</p>` : ''}
+                        </div>
+                        <span class="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded">${d.tty || d.product_type || ''}</span>
+                    </div>
+                    ${d.pharm_classes ? `<p class="text-xs text-green-600 mt-1">${escapeHtml(d.pharm_classes.substring(0,100))}</p>` : ''}
+                </div>
+            `).join('')}
+        `;
+    } catch (err) {
+        document.getElementById('search-results').innerHTML = `<p class="text-center text-red-400 py-4">Error: ${err.message}</p>`;
+    }
+}
+
+// Interaction Check
+async function checkInteractions(e) {
+    e.preventDefault();
+    const drugs = document.getElementById('interaction-input').value.trim().split('\n').filter(d => d.trim());
+    if (drugs.length < 2) { alert('Enter at least 2 drug names'); return; }
+
+    document.getElementById('interaction-results').innerHTML = '<p class="text-center text-gray-400 py-4">Checking interactions...</p>';
+
+    try {
+        const res = await fetch(`${API}/api/v1/interactions/check`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({drug_names: drugs}),
+        });
+        const data = await res.json();
+        const container = document.getElementById('interaction-results');
+
+        if (data.interactions_found === 0) {
+            container.innerHTML = `<div class="bg-green-50 border border-green-200 rounded-xl p-4 text-center">
+                <p class="text-green-700 font-medium">No interactions found</p>
+                <p class="text-xs text-green-600 mt-1">Checked ${data.checked_pairs} drug pairs</p>
+            </div>`;
+            return;
+        }
+
+        container.innerHTML = `
+            <div class="bg-red-50 border border-red-200 rounded-xl p-3 mb-3">
+                <p class="text-red-700 font-medium">${data.interactions_found} interaction(s) found</p>
+                <p class="text-xs text-red-600">${data.checked_pairs} pairs checked</p>
+            </div>
+            ${data.interactions.map(i => {
+                const sevColor = i.severity === 'major' ? 'red' : i.severity === 'moderate' ? 'yellow' : 'green';
+                return `<div class="bg-white border rounded-xl p-3 mb-2">
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="font-medium text-sm">${escapeHtml(i.drug1)} + ${escapeHtml(i.drug2)}</span>
+                        <span class="text-xs bg-${sevColor}-100 text-${sevColor}-700 px-2 py-0.5 rounded font-medium">${(i.severity||'unknown').toUpperCase()}</span>
+                    </div>
+                    <p class="text-xs text-gray-500">${i.total_labels || 0} FDA labels mention this interaction</p>
+                    ${i.mentions && i.mentions[0] ? `<p class="text-xs text-gray-600 mt-1 line-clamp-3">${escapeHtml(i.mentions[0].interaction_text?.substring(0,200) || '')}...</p>` : ''}
+                </div>`;
+            }).join('')}
+        `;
+    } catch (err) {
+        document.getElementById('interaction-results').innerHTML = `<p class="text-center text-red-400 py-4">Error: ${err.message}</p>`;
+    }
+}
+
+// Helpers
+function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function formatResponse(text) {
+    if (!text) return '';
+    let html = escapeHtml(text);
+    html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\n- /g, '\n&#8226; ');
+    return html;
+}
+</script>
+</body>
+</html>
