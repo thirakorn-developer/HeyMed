@@ -510,15 +510,30 @@ async def calculate_dose(
 ) -> str:
     """Calculate recommended dosage for a drug based on patient weight and age.
     For pediatric patients, set is_pediatric=true and provide weight in kg.
-    Returns: recommended dose, frequency, max daily dose, available tablet sizes,
-    and how many tablets to take."""
+    Returns: calculated dose + FDA label reference for verification.
+    IMPORTANT: Always verify calculated dose against FDA label before dispensing."""
     dosing = get_dosing(drug_name)
+
+    # Always fetch FDA label as authoritative reference
+    # FDA uses "acetaminophen" not "paracetamol"
+    fda_lookup_name = drug_name
+    if dosing:
+        generic = dosing.get("generic_name", drug_name)
+        if "acetaminophen" in generic.lower():
+            fda_lookup_name = "acetaminophen"
+    fda_dosing = await external_apis.openfda_drug_label_sections(fda_lookup_name)
+    fda_text = ""
+    if fda_dosing:
+        fda_text = (fda_dosing.get("dosage_and_administration", [""])[0])[:1500]
+
     if not dosing:
-        available = list_available_drugs()
         return json.dumps({
-            "error": f"No dosing data for '{drug_name}'",
-            "available_drugs": available,
-            "hint": "Try get_dosing_info for FDA label text instead.",
+            "drug_name": drug_name,
+            "calculation_available": False,
+            "fda_dosing_text": fda_text or "No FDA label found",
+            "message": f"No structured dosing data for '{drug_name}'. See FDA label text above for dosing guidance.",
+            "available_drugs_for_calculation": list_available_drugs(),
+            "disclaimer": "Always verify dosing with official FDA label or clinical reference before dispensing.",
         })
 
     strengths = dosing["available_strengths"]
@@ -587,6 +602,9 @@ async def calculate_dose(
 
     result["renal_adjustment"] = dosing.get("renal_adjustment", "")
     result["hepatic_adjustment"] = dosing.get("hepatic_adjustment", "")
+    result["calculation_available"] = True
+    result["fda_dosing_text"] = fda_text or "FDA label not available — verify with official reference"
+    result["disclaimer"] = "CALCULATED DOSE — verify against FDA label before dispensing. This is a clinical decision support tool, not a substitute for professional judgment."
     return json.dumps(result)
 
 
