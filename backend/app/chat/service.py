@@ -149,7 +149,7 @@ TOOL_ENDPOINT_MAP = {
     "check_interactions": ("POST", "/api/v1/interactions/check", lambda a: a),
     "adverse_events": ("GET", "/api/v1/interactions/adverse-events", lambda a: {"drug_name": a["drug_name"]}),
     "food_interactions": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 3}),
-    "find_alternatives": ("GET", "/api/v1/ndc/search", lambda a: {"q": a["drug_name"], "limit": 10}),
+    "find_alternatives": ("GET", "/api/v1/ndc/alternatives", lambda a: {"drug_name": a["drug_name"], "limit": 10}),
     "pregnancy_info": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 1}),
     "storage_conditions": ("GET", "/api/v1/drugs/search", lambda a: {"q": a["drug_name"], "limit": 1}),
     "thai_fda_search": ("GET", "/api/v1/ndc/search", lambda a: {"q": a["query"], "limit": 5}),
@@ -273,19 +273,31 @@ async def chat_in_session(
 
     # Save user message
     await _save_message(db, sid, "user", content=user_message)
+    await db.flush()
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     total_tokens = 0
+    tool_call_count = 0
 
-    for _ in range(5):
-        response = await client.chat.completions.create(
-            model=model, messages=messages, tools=TOOLS,
-            tool_choice="auto", temperature=0.3, max_tokens=1000,
-        )
+    for iteration in range(8):
+        try:
+            response = await client.chat.completions.create(
+                model=model, messages=messages, tools=TOOLS,
+                tool_choice="auto", temperature=0.3, max_tokens=1000,
+            )
+        except Exception as e:
+            ai_response = f"API error: {e}"
+            await _save_message(db, sid, "assistant", content=ai_response)
+            await db.commit()
+            return {"session_id": session_id, "response": ai_response, "model": model,
+                    "tokens_this_turn": total_tokens, "tool_calls_made": 0}
+
         total_tokens += response.usage.total_tokens if response.usage else 0
         choice = response.choices[0]
 
-        if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
+        has_tool_calls = choice.message.tool_calls and len(choice.message.tool_calls) > 0
+
+        if has_tool_calls:
             tool_calls_data = [
                 {"id": tc.id, "type": "function",
                  "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
@@ -294,17 +306,23 @@ async def chat_in_session(
             messages.append({"role": "assistant", "content": None, "tool_calls": tool_calls_data})
 
             for tc in choice.message.tool_calls:
-                tool_args = json.loads(tc.function.arguments)
-                tool_result = await _call_tool(tc.function.name, tool_args)
+                try:
+                    tool_args = json.loads(tc.function.arguments)
+                    tool_result = await _call_tool(tc.function.name, tool_args)
+                except Exception as e:
+                    tool_result = json.dumps({"error": str(e)})
 
+                tool_call_count += 1
                 await _save_message(db, sid, "tool",
                                     tool_name=tc.function.name,
                                     tool_result=tool_result[:2000])
+                await db.flush()
 
                 messages.append({
                     "role": "tool", "tool_call_id": tc.id,
                     "content": tool_result[:3000],
                 })
+            continue
         else:
             ai_response = choice.message.content or ""
             await _save_message(db, sid, "assistant", content=ai_response, tokens=total_tokens)
@@ -326,11 +344,26 @@ async def chat_in_session(
                 "response": ai_response,
                 "model": model,
                 "tokens_this_turn": total_tokens,
-                "tool_calls_made": len([m for m in messages if isinstance(m, dict) and m.get("role") == "tool"]),
+                "tool_calls_made": tool_call_count,
             }
 
+    # If we get here, the loop exhausted — try to get whatever content was last
+    last_content = ""
+    if messages:
+        for m in reversed(messages):
+            if isinstance(m, dict) and m.get("role") == "assistant" and m.get("content"):
+                last_content = m["content"]
+                break
+
+    if last_content:
+        await _save_message(db, sid, "assistant", content=last_content, tokens=total_tokens)
+        await db.commit()
+        return {"session_id": session_id, "response": last_content, "model": model,
+                "tokens_this_turn": total_tokens, "tool_calls_made": tool_call_count}
+
     await db.commit()
-    return {"session_id": session_id, "response": "Could not process request.", "model": model}
+    return {"session_id": session_id, "response": "ขออภัย ไม่สามารถประมวลผลได้ กรุณาลองใหม่อีกครั้ง", "model": model,
+            "tokens_this_turn": total_tokens, "tool_calls_made": tool_call_count}
 
 
 # Need this import for the update statement

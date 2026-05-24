@@ -116,6 +116,59 @@ async def lookup_ndc(ndc_code: str, db: AsyncSession = Depends(get_db)):
     }
 
 
+@router.get("/alternatives")
+async def find_alternatives(
+    drug_name: str = Query(..., min_length=2),
+    limit: int = Query(10, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+):
+    source = (await db.execute(
+        select(NdcProduct)
+        .where(NdcProduct.search_vector.op("@@")(func.plainto_tsquery("english", drug_name)))
+        .where(NdcProduct.pharm_classes.is_not(None))
+        .where(~NdcProduct.substance_name.contains(";"))
+        .order_by(func.ts_rank(NdcProduct.search_vector, func.plainto_tsquery("english", drug_name)).desc())
+        .limit(1)
+    )).scalar_one_or_none()
+
+    if not source or not source.pharm_classes:
+        return {"drug_name": drug_name, "error": "No pharmacological class found", "alternatives": []}
+
+    epcs = []
+    for cls in source.pharm_classes.split(","):
+        cls = cls.strip()
+        if "[EPC]" in cls:
+            epcs.append(cls.replace("[EPC]", "").strip())
+
+    if not epcs:
+        return {"drug_name": drug_name, "error": "No EPC class found", "alternatives": []}
+
+    epc = epcs[0]
+    result = await db.execute(
+        select(NdcProduct.generic_name, NdcProduct.brand_name, NdcProduct.dosage_form,
+               NdcProduct.route, NdcProduct.strength, NdcProduct.strength_unit)
+        .where(NdcProduct.pharm_classes.ilike(f"%{epc}%"))
+        .where(~NdcProduct.generic_name.ilike(f"%{drug_name}%"))
+        .where(~NdcProduct.substance_name.ilike(f"%{drug_name}%"))
+        .where(~NdcProduct.substance_name.contains(";"))
+        .distinct(func.upper(NdcProduct.generic_name))
+        .order_by(func.upper(NdcProduct.generic_name), NdcProduct.brand_name)
+        .limit(limit)
+    )
+
+    return {
+        "drug_name": drug_name,
+        "matched_from": source.generic_name,
+        "pharmacologic_class": epc,
+        "all_classes": epcs,
+        "alternatives": [
+            {"generic_name": r[0], "brand_name": r[1], "dosage_form": r[2],
+             "route": r[3], "strength": r[4], "strength_unit": r[5]}
+            for r in result.all()
+        ],
+    }
+
+
 @router.get("/stats")
 async def ndc_stats(db: AsyncSession = Depends(get_db)):
     prod_count = await db.execute(select(func.count(NdcProduct.id)))
