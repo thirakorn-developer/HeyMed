@@ -1,4 +1,15 @@
+import json as json_module
+
 import httpx
+
+from heymed_mcp.cache import (
+    TTL_ADVERSE,
+    TTL_DRUG_DATA,
+    TTL_INTERACTIONS,
+    TTL_RECALLS,
+    get_cached,
+    set_cached,
+)
 
 _client: httpx.AsyncClient | None = None
 
@@ -14,6 +25,10 @@ def _get_client() -> httpx.AsyncClient:
 
 
 async def rxnorm_search(name: str) -> list[dict]:
+    cached = await get_cached("rxnorm_search", name)
+    if cached:
+        return json_module.loads(cached)
+
     client = _get_client()
     resp = await client.get(
         "https://rxnav.nlm.nih.gov/REST/drugs.json", params={"name": name}
@@ -23,6 +38,8 @@ async def rxnorm_search(name: str) -> list[dict]:
     for group in resp.json().get("drugGroup", {}).get("conceptGroup", []):
         for c in group.get("conceptProperties", []):
             results.append({"rxcui": int(c["rxcui"]), "name": c["name"], "tty": c["tty"]})
+
+    await set_cached("rxnorm_search", json_module.dumps(results), TTL_DRUG_DATA, name)
     return results
 
 
@@ -37,6 +54,10 @@ async def rxnorm_properties(rxcui: int) -> dict | None:
 
 
 async def rxnorm_all_related(rxcui: int) -> dict:
+    cached = await get_cached("rxnorm_related", rxcui)
+    if cached:
+        return json_module.loads(cached)
+
     client = _get_client()
     resp = await client.get(f"https://rxnav.nlm.nih.gov/REST/rxcui/{rxcui}/allrelated.json")
     resp.raise_for_status()
@@ -49,6 +70,8 @@ async def rxnorm_all_related(rxcui: int) -> dict:
         ]
         if concepts:
             grouped[tty] = concepts
+
+    await set_cached("rxnorm_related", json_module.dumps(grouped), TTL_DRUG_DATA, rxcui)
     return grouped
 
 
@@ -72,6 +95,12 @@ async def rxnorm_spelling(term: str) -> list[str]:
 
 
 async def openfda_interaction_check(drug1: str, drug2: str) -> dict | None:
+    cache_key_args = tuple(sorted([drug1.lower(), drug2.lower()]))
+    cached = await get_cached("interaction", *cache_key_args)
+    if cached:
+        result = json_module.loads(cached)
+        return result if result else None
+
     client = _get_client()
     mentions = []
 
@@ -113,13 +142,14 @@ async def openfda_interaction_check(drug1: str, drug2: str) -> dict | None:
             })
 
     if not mentions:
+        await set_cached("interaction", json_module.dumps(None), TTL_INTERACTIONS, *cache_key_args)
         return None
 
     severities = [m["severity"] for m in mentions]
     severity_rank = {"major": 3, "moderate": 2, "minor": 1}
     overall = max(severities, key=lambda s: severity_rank.get(s, 0))
 
-    return {
+    result = {
         "drug1": drug1,
         "drug2": drug2,
         "found": True,
@@ -127,6 +157,8 @@ async def openfda_interaction_check(drug1: str, drug2: str) -> dict | None:
         "total_labels": sum(m["total_labels"] for m in mentions),
         "mentions": mentions,
     }
+    await set_cached("interaction", json_module.dumps(result), TTL_INTERACTIONS, *cache_key_args)
+    return result
 
 
 _MAJOR_KEYWORDS = [
@@ -155,6 +187,10 @@ def _classify_interaction_severity(text: str) -> str:
 
 
 async def openfda_adverse_events(drug_name: str, limit: int = 10) -> list[dict]:
+    cached = await get_cached("adverse_events", drug_name, limit)
+    if cached:
+        return json_module.loads(cached)
+
     client = _get_client()
     resp = await client.get(
         "https://api.fda.gov/drug/event.json",
@@ -166,7 +202,10 @@ async def openfda_adverse_events(drug_name: str, limit: int = 10) -> list[dict]:
     )
     if resp.status_code != 200:
         return []
-    return [{"reaction": r["term"], "count": r["count"]} for r in resp.json().get("results", [])]
+    results = [{"reaction": r["term"], "count": r["count"]} for r in resp.json().get("results", [])]
+
+    await set_cached("adverse_events", json_module.dumps(results), TTL_ADVERSE, drug_name, limit)
+    return results
 
 
 async def openfda_food_interactions(drug_name: str) -> dict | None:
